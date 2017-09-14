@@ -17,12 +17,36 @@ void signal_callback_handler(int signum){
 }
 
 Master::Master(unsigned short port)
-    : threads_counter(0)
-    , port(port)
+    : port(port)
     , workers()
     , socket_fd(-1)
 {
+#if USE_EPOLL == 1
+  num_core = sysconf(_SC_NPROCESSORS_ONLN);
+  LOG_MSG << "Detected " << num_core << " cores";  
+  for (int i = 0; i < num_core*2; i++) {
+    epoll_master_workers.push_back(new EpollMasterWorker());
+  }
+#endif
 }
+
+int Master::make_socket_non_blocking (int sfd) {
+  int flags, s;
+  flags = fcntl (sfd, F_GETFL, 0);
+  if (flags == -1) {
+    perror ("fcntl");
+    return -1;
+  }
+
+  flags |= O_NONBLOCK;
+  s = fcntl (sfd, F_SETFL, flags);
+  if (s == -1) {
+    perror ("fcntl");
+    return -1;
+  }
+  return 0;
+}
+
 
 Master::~Master()
 {
@@ -51,7 +75,7 @@ bool Master::init()
     if (listen(socket_fd, port) < 0)
       DIE("error: cannot listen on port ");
 
-    LOG_INFO << "listening on port " << port;
+    LOG_MSG << "listening on port " << port;
 
     return true;
 }
@@ -87,10 +111,16 @@ void Master::run() {
                 LOG_ERROR << "error: unable to accept client " << strerror(errno);
             }
         } else {
-            LOG_DEBUG << "new client (total = " << (threads_counter + 1) << ")";
+            LOG_DEBUG << "new client";
             MasterWorker * worker = new MasterWorker(*this, worker_socket);
+#if USE_EPOLL == 1
+            make_socket_non_blocking(worker_socket);
+            int r1 = rand() % epoll_master_workers.size();
+            int r2 = rand() % epoll_master_workers.size();
+            EpollMasterWorker* selected = epoll_master_workers[r1]->get_count() < epoll_master_workers[r2]->get_count()?epoll_master_workers[r1]:epoll_master_workers[r2];
+            selected->add(worker_socket, worker);
+#else
             workers.push_back(worker);
-
             pthread_t thread;
             if (pthread_create(&thread, 0, &MasterWorker::pthread_helper, worker)) {
                 LOG_ERROR << "error: unable to create thread";
@@ -100,6 +130,7 @@ void Master::run() {
                 LOG_ERROR << "error: unable to detach thread";
                 continue;
             }
+#endif
         }
     }
     cleanup();

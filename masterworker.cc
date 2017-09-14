@@ -20,12 +20,12 @@ MasterWorker::MasterWorker(Master &master, int socket)
   : master(master)
   , socket(socket)
 {
+  init();
 }
 
 
 void MasterWorker::init()
 {
-  ++master.threads_counter;
   int yes = 1;
   if (setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)))
     LOG_ERROR << "error: unable to set socket option TCP_NODELAY";
@@ -37,15 +37,13 @@ void MasterWorker::init()
   char ip_str[20];
   strcpy(ip_str, inet_ntoa(addr.sin_addr));
   ip = ip_str;
+  this->addr = ip;
   LOG_DEBUG << "Connection from " << ip;
 }
 
 void MasterWorker::exit()
 {
   close(socket);
-  --master.threads_counter;
-  LOG_INFO << "client lost (total = " << master.threads_counter << ")";
-  pthread_exit(nullptr);
 }
 
 string MasterWorker::readline() {
@@ -65,43 +63,47 @@ string MasterWorker::readline() {
   return line;
 }
 
-void MasterWorker::run() {
-  init();
+void MasterWorker::do_action() {
   vector<string> cmds;
   vector<string> rets;
   string ret, msg;
-  while (true) {
-    msg = readline();
-    if (msg == "")
-      break;
-    cmds.clear();
-    rets.clear();
-    LOG_DEBUG << "Received msg<-" << addr << ":lambda" << lambda_seq << " " << msg;
-    boost::split(cmds, msg, boost::is_any_of("/"));        
-    for (auto const& cmd : cmds) {
-      rets.push_back(handle_msg(cmd));
-    }
-    ret = boost::algorithm::join(rets, "/");
-    LOG_DEBUG << "Sending msg->" << addr << ":lambda" << lambda_seq << " " << ret;
-    string response = ret + "\n";
-    assert(response.size() < 1024 * 1024);
-    int total_written = 0, written = 0;
-    while(true) {
-      if ( (written = write(socket, response.c_str() + total_written, response.size() - total_written)) < 0) {
-        if (errno == EAGAIN)
-          continue;
-        else if (errno == ECONNRESET || errno == EPIPE)
-          return;
-        else {
-          std::cerr << "error: unable to write socket " << socket << std::endl;
-          break;
-        }
-      }
-      total_written += written;
-      if (total_written >= response.size())
+  msg = readline();
+  if (msg == "")
+    return;
+  cmds.clear();
+  rets.clear();
+  LOG_DEBUG << "Received msg<-" << addr << ":lambda" << lambda_seq << " " << msg;
+  boost::split(cmds, msg, boost::is_any_of("/"));        
+  for (auto const& cmd : cmds) {
+    rets.push_back(handle_msg(cmd));
+  }
+  ret = boost::algorithm::join(rets, "/");
+  LOG_DEBUG << "Sending msg->" << addr << ":lambda" << lambda_seq << " " << ret;
+  string response = ret + "\n";
+  assert(response.size() < 1024 * 1024);
+  int total_written = 0, written = 0;
+  while(true) {
+    if ( (written = write(socket, response.c_str() + total_written, response.size() - total_written)) < 0) {
+      if (errno == EAGAIN)
+        continue;
+      else if (errno == ECONNRESET || errno == EPIPE)
+        return;
+      else {
+        std::cerr << "error: unable to write socket " << socket << std::endl;
         break;
+      }
     }
-    assert(total_written == response.size());
+    total_written += written;
+    if (total_written >= response.size())
+      break;
+  }
+  assert(total_written == response.size());
+
+}
+
+void MasterWorker::run() {
+  while (true) {
+    do_action();
   }
   LOG_DEBUG << "Connection disconnected";
   exit();
@@ -145,10 +147,15 @@ string MasterWorker::handle_msg(string msg) {
 }
 
 string MasterWorker::handle_new_server(vector<string> parts) {
+  //new_server|port|lambda_id(optional)
   port = parts[1];
   addr = ip + ":" + port; //TODO addr should be cacheserver addr, not lambda addr
   LOG_DEBUG << "handle new_server from " << addr;
-  lambda_seq = master.registry.get_lambda_seq();
+  if (parts.size() < 3 || parts[2] == "") {
+    lambda_seq = master.registry.get_lambda_seq();
+  } else {
+    lambda_seq = atoi(parts[2].substr(6).c_str());
+  }
   return "new_server_ack|" + parts[1] + "|" + to_string(lambda_seq);
 }
 
@@ -182,26 +189,34 @@ string MasterWorker::handle_consistent_lock(vector<string> parts) {
   LOG_DEBUG << "handle consistent_lock from " << addr << " pre_check_loc " << pre_check_loc;
 
   if (parts[1] == "write" || (parts[5] == "s3" && pre_check_loc == "")) {
+    LOG_DEBUG << "write branch";
     string ret, loc;
-    if (parts[8] == "recent") {
-      ret = master.registry.consistent_write_lock(parts[2], addr, parts[3], atoi(parts[4].c_str()), parts[6] == "snap");
-      loc = master.registry.get_location(parts[2], addr);
-      if(ret == "success") {
-        uint lambda_id = atoi(parts[3].substr(6).c_str());
-        if( parts[7] == "check_loc" && parts[5] != "s3") { //check_loc iff open as rw
-          uint key_version = master.registry.get_key_version(parts[2], true);
-          master.registry.register_lineage(lambda_id, parts[2], key_version);
-        }
-        master.registry.register_lock(lambda_id, parts[2], true);
+    ret = master.registry.consistent_write_lock(parts[2], addr, parts[3], atoi(parts[4].c_str()), parts[6] == "snap");
+    loc = master.registry.get_location(parts[2], addr);
+    if(ret == "success") {
+      //LOG_DEBUG << "ret = success";
+      uint lambda_id = atoi(parts[3].substr(6).c_str());
+      if( parts[7] == "check_loc" && parts[5] != "s3") { //check_loc iff open as rw
+        //LOG_DEBUG << "check_loc and s3";
+        uint key_version = master.registry.get_key_version(parts[2], true);
+        master.registry.register_lineage(lambda_id, parts[2], key_version);
       }
-    } else {
-      ret = "success";
-      loc = master.registry.get_location_version(parts[2], addr, atoi(parts[8].c_str()));
+      master.registry.register_lock(lambda_id, parts[2], true);
+    } else { 
+      if (parts[8] == "recent") {
+        //can't lock 
+      } else {
+        //LOG_DEBUG << "part[8] != recent";
+        ret = "success";
+        loc = master.registry.get_location_version(parts[2], addr, atoi(parts[8].c_str()));
+      }
     }
     return "consistent_lock_ack|" + ret + "|write|" + loc;
   } else if (parts[1] == "read") {
+    LOG_DEBUG << "read branch";
     string ret, loc;
     if (parts[8] == "recent") {
+      //LOG_DEBUG << "parts[8] == recent";
       ret = master.registry.consistent_read_lock(parts[2], addr, parts[3], atoi(parts[4].c_str()), parts[6] == "snap");
       loc = master.registry.get_location(parts[2], addr);
       if(ret == "success") {
@@ -211,8 +226,15 @@ string MasterWorker::handle_consistent_lock(vector<string> parts) {
         master.registry.register_lock(lambda_id, parts[2], false);
       }
     } else {
+      //LOG_DEBUG << "parts[8] != recent";
       ret = "success";
-      loc = master.registry.get_location_version(parts[2], addr, atoi(parts[8].c_str()));
+      if (parts[5] != "s3") {
+        //LOG_DEBUG << "get_location_version";
+        loc = master.registry.get_location_version(parts[2], addr, atoi(parts[8].c_str()));
+      } else { //you just want the newest version
+        //LOG_DEBUG << "get_location";
+        loc = master.registry.get_location(parts[2], addr);
+      }
     }
     return "consistent_lock_ack|" + ret + "|read|" + loc;
   } else {

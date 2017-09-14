@@ -6,6 +6,9 @@ import threading
 import time
 import boto3
 import errno
+import multiprocessing 
+import concurrent.futures as fs
+import smart_open
 
 STORAGE = "/dev/shm/cache/"
 
@@ -60,6 +63,7 @@ class FOutputStream():
     self.fd.write(s)
 
   def upload_s3(self):
+    self.client.log.debug("Start syncing %s to s3." % self.fn)
     self.client.s3.upload_file(self.fn, self.bucket, self.key + ".%s" % self.client.seq)
     self.s3_uploaded = True
     self.client.log.debug("%s synced to s3." % self.fn)
@@ -76,7 +80,6 @@ class FOutputStream():
       msg = "0|failover_write_update|%s|%s|%s\n" % (self.shm_name, self.client.lambda_id[6:], self.client.lambda_id)
       self.client.master.sendall(msg)
       self.client.master.recv(1024)      
-      return True 
     #normal execution
     else:
       if self.consistency:
@@ -85,9 +88,9 @@ class FOutputStream():
       else:
         self.client.send_put(self.bucket, self.key, self.consistency)
         ack = self.client.master.recv(1024)
-      if self.s3:
-        threading.Thread(target=self.upload_s3).start()   
-      return True
+    if self.s3:
+      threading.Thread(target=self.upload_s3).start()   
+    return True
 
 class FInputStream:
   def __init__(self, fn, bucket, key, client, size = None, consistency = False, s3 = False):
@@ -129,8 +132,8 @@ class FInputStream:
         if len(data) > 0:
           buf.append(data)
           curr += len(data)
-        else:
-          time.sleep(0.001)
+        #else:
+        #  time.sleep(0.001)
       assert curr == amt
       self.has_read += curr
       return b''.join(buf) 
@@ -139,16 +142,21 @@ class FInputStream:
     if self.size is None:
       return self.f.readline()
     else:
+      if self.size == self.has_read:
+        return ""
       tmp = ""
       while True:
+      #for x in range(10000):
         rd = self.f.readline()
         if len(rd) > 0:
           tmp += rd
           if tmp[-1] == '\n' or self.has_read + len(tmp) == self.size:
               self.has_read += len(tmp)
               return tmp
-        else:
-          time.sleep(0.001)
+        #else:
+        #  time.sleep(0.001)
+      #self.client.log.debug("Read Error, size %s, tmp %s, len(tmp) %s, has_read %s" % (self.size, tmp, len(tmp), self.has_read))
+      #assert False
 
   def get_file_name(self):
     rp = os.path.realpath(self.fn)
@@ -179,6 +187,12 @@ class FInputStream:
       if self.consistency:
         self.client.direct_unlock(self.bucket, self.key, write = False, modified = True, s3 = self.s3)
       else:
+        self.client.log.debug("sending put to master: %s/%s" % (self.bucket, self.key))
+        self.client.send_put(self.bucket, self.key, False)
+        self.client.log.debug("waiting master to ack")
+        ack = self.client.master.recv(1024)
+        self.client.log.debug("master acked")
+
         self.client.cache_reg(self.bucket, self.key, consistency = False)
 
   def set_socket_timeout(self, timeout):
@@ -190,12 +204,36 @@ class FInputStream:
 class LockException(Exception):
   pass
 
+def s3_recv_proc(tmp_fn, bucket, key, consistency, size):
+  while True:
+    try:
+      print "s3_recv_proc: Start reading %s:%s from s3, size %s" % (bucket, key, size)
+      f = open(tmp_fn, "wb")
+      s3 = boto3.client("s3")
+      obj = s3.get_object(Bucket = bucket, Key = key)
+      #obj = smart_open.smart_open("s3://%s/%s" % (bucket, key))
+      total_read = 0
+      while True:
+        data = obj["Body"].read(min(100 * 1024, size - total_read))
+        #data = obj.read(min(100 * 1024, size - total_read))
+        if len(data) == 0:
+          break
+        total_read += len(data)
+        f.write(data)
+      f.close()
+      assert size == total_read
+      print "s3_recv_proc: Done reading %s:%s from s3, size %s" % (bucket, key, size)
+      return
+    except Exception as e:
+      print "s3_recv_proc: %s" % e
+
 class CacheClient:
   def __init__(self, master_ip = None, extra = {}):
-    self.bg_read = False
+    self.s3_bg_read = True
+    self.peer_bg_read = False
 
-    #loglevel = logging.DEBUG
-    loglevel = logging.CRITICAL
+    loglevel = logging.DEBUG
+    #loglevel = logging.CRITICAL
     self.log = logging.getLogger("CacheClient")
     self.log.setLevel(loglevel)
     if not self.log.handlers:
@@ -210,10 +248,12 @@ class CacheClient:
     self.sockets = {}
     self.closed = False
     self.commit_write_done = False
+    self.executor = multiprocessing.Pool(processes=3)
+    #self.executor = fs.ProcessPoolExecutor(max_workers=8)
 
     self.master = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     self.master.connect((self.master_ip, 1988))
-    self.master.sendall("0|new_server|1222\n")
+    self.master.sendall("0|new_server|1222|%s\n" % ("" if "lambda_id" not in extra else extra["lambda_id"]))
     self.seq = int(self.master.recv(1024).split("|")[3])
     self.lambda_id = "lambda" + str(self.seq) if "lambda_id" not in extra else extra["lambda_id"]
     self.replay_inputs = None if "replay_inputs" not in extra else extra["replay_inputs"]
@@ -320,12 +360,13 @@ class CacheClient:
         recvd += len(received[1])
         break
     self.log.debug("header received: %s" % header)
-    if self.bg_read and size > 100 * 1024:
+    if self.peer_bg_read and size > 100 * 1024:
       threading.Thread(target=self.peer_recv, args=(conn, f, recvd, size, fn, tmp_fn )).start()
     else:
       self.peer_recv(conn, f, recvd, size, fn, tmp_fn)
     self.log.debug("peer read done. size %s" % size)
     return (size, tmp_key)
+
 
   def s3_recv(self, f, obj, bucket, key, consistency, size):
     self.log.debug("s3 receive")
@@ -337,13 +378,9 @@ class CacheClient:
       total_read += len(data)
       f.write(data)
     f.close()
-    self.log.debug("all data received")
-    if not consistency:
-      self.log.debug("sending put to master")
-      self.send_put(bucket, key, False)
-      self.log.debug("waiting master to ack")
-      ack = self.master.recv(1024)
-      self.log.debug("master acked")
+    self.log.debug("all data received, size %s, total_read %s" % (size, total_read))
+    assert size == total_read
+
     self.log.debug("s3_recv done")
 
   def s3_read(self, name, bucket, key, consistency):
@@ -352,13 +389,19 @@ class CacheClient:
     tmp_fn = STORAGE + "~~tmp~" +name + "~" + str(self.seq)
     obj = self.s3.get_object(Bucket = bucket, Key = key)
     size = obj['ContentLength']
+    self.log.debug("size %s" % size)
     f = open(tmp_fn, "wb")
-    if size < 100 * 1024:
+    if self.s3_bg_read and size > 5 * 1024 * 1024:
+      #threading.Thread(target=self.s3_recv, args=(f, obj, bucket, key, consistency, size)).start()
+      f.close()
+      self.log.debug("Async s3_recv")
+      #multiprocessing.Process(target=CacheClient.s3_recv_proc, args=(tmp_fn, bucket, key, consistency, size)).start()
+      self.executor.apply_async(s3_recv_proc, (tmp_fn, bucket, key, consistency, size,))
+      #self.executor.submit(s3_recv_proc, tmp_fn, bucket, key, consistency, size)
+    else:
       data = obj["Body"].read()
       f.write(data)
       f.close()
-    else:
-      threading.Thread(target=self.s3_recv, args=(f, obj, bucket, key, consistency, size)).start()
     self.log.debug("creating symlink")
     tmp_link = STORAGE + "lnk" + str(random.randint(0,1000000))
     os.symlink(tmp_fn, tmp_link)
@@ -395,7 +438,13 @@ class CacheClient:
     check_loc = "check_loc" if read_write else "no_check_loc"
     use_s3 = "s3" if s3 else "nos3"
     snap_iso = "snap" if snap else "no_snap"
-    version = "recent" if self.replay_inputs is None or name not in self.replay_inputs else self.replay_inputs[name].version
+    if write:
+      version = "recent" if self.replay_inputs is None else self.lambda_id[6:]
+    else:
+      if s3:
+        version = "recent" if self.replay_inputs is None else self.lambda_id[6:]    
+      else:
+        version = "recent" if (self.replay_inputs is None or name not in self.replay_inputs) else self.replay_inputs[name].version
     msg = "0|consistent_lock|%s|%s|%s|%s|%s|%s|%s|%s\n" % (rw, name, self.lambda_id, max_duration, use_s3, snap_iso, check_loc, version)
     while True:
       self.log.debug("sending direct lock: %s" % msg[0:-1])

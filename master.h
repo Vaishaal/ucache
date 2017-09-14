@@ -9,7 +9,9 @@
 #include "masterworker.h"
 #include "masterregistry.h"
 #include <unistd.h>
-
+#include <vector>
+#include "epollmasterworker.h"
+#define USE_EPOLL 1
 
 class MasterWorker;
 
@@ -21,16 +23,18 @@ public:
     ~Master(); // No virtual needed since no inheritance as of now.
 
     void run();
-    volatile std::atomic<unsigned int> threads_counter;
     MasterRegistry registry;
 
 protected:
     bool init();
     void cleanup();
+    int make_socket_non_blocking(int);
 
+    vector<EpollMasterWorker*> epoll_master_workers;
     std::uint16_t port;
     std::list<MasterWorker *> workers; // One worker per client
     int socket_fd;
+    int num_core;
 };
 
 
